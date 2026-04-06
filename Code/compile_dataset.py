@@ -109,17 +109,43 @@ def calc_mv_for_year(history: list, target_year: int) -> float | None:
     return float(np.mean(values)) if values else None
 
 
-def calc_age_at_season_start(dob_str: str | None, start_year: int) -> int | None:
+# CL final dates by season-ending year (used as age reference point)
+CL_FINAL_DATES = {
+    2018: date(2018, 5, 26),  # Kiev
+    2019: date(2019, 6,  1),  # Madrid
+    2020: date(2020, 8, 23),  # Lisbon (COVID)
+    2021: date(2021, 5, 29),  # Porto
+    2022: date(2022, 5, 28),  # Paris
+    2023: date(2023, 6, 10),  # Istanbul
+    2024: date(2024, 6,  1),  # London
+    2025: date(2025, 5, 31),  # Munich
+}
+
+
+def calc_age_at_cl_final(dob_raw, end_year: int) -> int | None:
     """
-    Calculate the player's age on August 1 of start_year (the CL season start).
+    Calculate the player's age at the CL final of the given season end year.
+    Accepts either a full date string ("Jan 4, 1994") or a plain birth year integer (1994).
     """
-    if not dob_str or pd.isna(dob_str):
+    ref = CL_FINAL_DATES.get(end_year)
+    if ref is None:
         return None
-    dob = _parse_date(str(dob_str))
+
+    # Integer birth year (derived from MV history)
+    if isinstance(dob_raw, (int, float)) and not pd.isna(dob_raw):
+        return ref.year - int(dob_raw)
+
+    if not dob_raw or pd.isna(dob_raw):
+        return None
+
+    dob = _parse_date(str(dob_raw))
     if dob is None:
-        return None
-    season_start = date(start_year, 8, 1)
-    return (season_start - dob).days // 365
+        # Last resort: treat the raw value as a plain year string
+        try:
+            return ref.year - int(str(dob_raw).strip())
+        except ValueError:
+            return None
+    return (ref - dob).days // 365
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +182,7 @@ def process_year(year: int, club_map: dict) -> pd.DataFrame | None:
         history = _parse_mv_history_string(row.get('Market Value History'))
         mv_starts.append(calc_mv_for_year(history, start_year))
         mv_ends.append(calc_mv_for_year(history, end_year))
-        ages.append(calc_age_at_season_start(row.get('Date of Birth'), start_year))
+        ages.append(calc_age_at_cl_final(row.get('Date of Birth'), end_year))
 
     # Build the output frame with standardised column names
     out = pd.DataFrame()
