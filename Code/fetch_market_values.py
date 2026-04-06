@@ -40,6 +40,7 @@ from itertools import cycle
 
 sys.path.insert(0, r'c:\Code_Learning\repos\transfermarkt-api')
 
+from bs4 import BeautifulSoup
 from app.services.base import _get_session
 from app.services.players.search import TransfermarktPlayerSearch
 
@@ -138,8 +139,18 @@ def _parse_ceapi_history(data) -> list:
     return result
 
 
-def _derive_birth_year(mv_raw) -> int | None:
-    """Derive birth year from a MV column value (fresh dict or stored string repr)."""
+def _derive_birth_date(mv_raw) -> str | None:
+    """
+    Derive an approximate birth date from MV history as an ISO string "YYYY-MM-DD".
+
+    Each snapshot has 'date' and 'age' (integer years). When consecutive snapshots
+    show age ticking from N to N+1, the birthday falls between those two dates —
+    we use the later snapshot's month as the approximate birth month (accuracy
+    typically ±1–3 months, far better than year-only).
+
+    Falls back to July 1 of the derived birth year when no age transition is found
+    (mid-year assumption minimises average error to ±6 months).
+    """
     if mv_raw is None:
         return None
     if isinstance(mv_raw, dict):
@@ -153,13 +164,38 @@ def _derive_birth_year(mv_raw) -> int | None:
             history = data.get('marketValueHistory', []) if isinstance(data, dict) else []
         except Exception:
             return None
-    years = []
+
+    dated = []
     for entry in history:
         d = _parse_date_simple(str(entry.get('date', '')))
         age_s = str(entry.get('age', ''))
         if d and age_s.isdigit():
-            years.append(d.year - int(age_s))
-    return Counter(years).most_common(1)[0][0] if years else None
+            dated.append((d, int(age_s)))
+
+    if not dated:
+        return None
+
+    dated.sort(key=lambda x: x[0])
+
+    # Find first age transition (N → N+1); birthday is between those two dates.
+    # Use the later snapshot's month/day as the approximate birthday.
+    for i in range(len(dated) - 1):
+        d_after, age_after = dated[i + 1]
+        d_before, age_before = dated[i]
+        if age_after == age_before + 1:
+            birth_year = d_after.year - age_after
+            try:
+                import calendar
+                last_day = calendar.monthrange(birth_year, d_after.month)[1]
+                from datetime import date as _date
+                return _date(birth_year, d_after.month, min(d_after.day, last_day)).isoformat()
+            except (ValueError, OverflowError):
+                return f"{birth_year}-{d_after.month:02d}-01"
+
+    # No transition found — derive year by majority vote, assume mid-year.
+    years = [d.year - a for d, a in dated]
+    birth_year = Counter(years).most_common(1)[0][0]
+    return f"{birth_year}-07-01"
 
 
 def _do_fetch_mv(player_id: str, player_name: str = '') -> dict | None:
@@ -175,6 +211,34 @@ def _do_fetch_mv(player_id: str, player_name: str = '') -> dict | None:
         return {'marketValueHistory': history} if history else None
     except Exception as e:
         print(f"    [MV error] {_fmt_error(e)}")
+        return None
+
+
+def _do_fetch_dob(player_id: str) -> str | None:
+    """
+    Fetch exact DOB from the player profile HTML page.
+    Returns ISO date string "YYYY-MM-DD" or None (if page is blocked or DOB not found).
+    No retry — the profile page is consistently blocked; failure falls back to
+    _derive_birth_date() from MV history.
+    """
+    d = _current_domain
+    url = f"https://www.{d}/-/profil/spieler/{player_id}"
+    try:
+        _sleep()
+        resp = _get_session().get(url, timeout=15)
+        if resp.status_code != 200:
+            return None
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        tag = soup.find(itemprop='birthDate')
+        if not tag:
+            return None
+        raw = tag.get_text(strip=True)
+        # Strip trailing age "(40)" if present
+        m = re.match(r'^(.+?)\s*\(\d+\)', raw)
+        dob_str = m.group(1).strip() if m else raw.strip()
+        d_obj = _parse_date_simple(dob_str)
+        return d_obj.isoformat() if d_obj else None
+    except Exception:
         return None
 
 
@@ -260,11 +324,16 @@ def process_year(year: int, limit: int | None = None) -> bool:
                 df.at[idx, MV_COLUMN] = result
                 needs_any = True
 
-        # -- birth year (derived from MV history — no extra API call) --
+        # -- date of birth: try profile page (exact); fall back to MV-derived estimate --
         if pd.isna(row.get('Date of Birth')):
-            birth_year = _derive_birth_year(df.at[idx, MV_COLUMN])
-            if birth_year:
-                df.at[idx, 'Date of Birth'] = birth_year
+            birth_date = None
+            if pid is not None:
+                print(f"  [{pos}/{total}] DOB   {name} (ID {pid})")
+                birth_date = _do_fetch_dob(pid)
+            if not birth_date:
+                birth_date = _derive_birth_date(df.at[idx, MV_COLUMN])
+            if birth_date:
+                df.at[idx, 'Date of Birth'] = birth_date
                 needs_any = True
 
         # -- player country (via search endpoint) --

@@ -66,7 +66,7 @@ def _parse_date(date_str: str) -> date | None:
     """
     if not date_str:
         return None
-    for fmt in ('%b %d, %Y', '%B %d, %Y', '%d/%m/%Y', '%m/%d/%Y'):
+    for fmt in ('%b %d, %Y', '%B %d, %Y', '%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d'):
         try:
             from datetime import datetime as dt
             return dt.strptime(date_str.strip(), fmt).date()
