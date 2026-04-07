@@ -42,7 +42,6 @@ sys.path.insert(0, r'c:\Code_Learning\repos\transfermarkt-api')
 
 from bs4 import BeautifulSoup
 from app.services.base import _get_session
-from app.services.players.search import TransfermarktPlayerSearch
 
 # Alternate between .us and .com on every request — each domain sees half the traffic,
 # allowing a shorter per-request delay without increasing load on either server.
@@ -57,12 +56,32 @@ DATA_DIR = Path(__file__).resolve().parent.parent / 'Data'
 REQUEST_DELAY_SECONDS = 3.0   # base pause between every API call
 DELAY_JITTER          = 1.5   # added random jitter: actual delay = base + U(0, jitter)
 MAX_RETRIES           = 3     # attempts per player before giving up
-RETRY_BASE_DELAY      = 10    # seconds; doubles each retry (10, 20, 40 …)
+RETRY_BASE_DELAY      = 5    # seconds; doubles each retry (10, 20, 40 …)
 SAVE_EVERY            = 20    # write to disk after this many players
 # ----------------------------------
 
 MV_COLUMN       = 'Market Value History'
 PROFILE_COLUMNS = ['Player Country', 'Date of Birth']
+
+# Wikidata sometimes returns long official country names; map them to the short
+# form used everywhere else in this dataset.
+_COUNTRY_NORM = {
+    "Kingdom of the Netherlands":            "Netherlands",
+    "People's Republic of China":            "China",
+    "Republic of Korea":                     "South Korea",
+    "Democratic People's Republic of Korea": "North Korea",
+    "Russian Federation":                    "Russia",
+    "United States of America":              "United States",
+    "Bosnia and Herzegovina":                "Bosnia-Herzegovina",
+    "Republic of Ireland":                   "Ireland",
+    "Slovak Republic":                       "Slovakia",
+    "Czech Republic":                        "Czech Republic",
+    "Federal Republic of Nigeria":           "Nigeria",
+    "Republic of Cameroon":                  "Cameroon",
+    "Islamic Republic of Iran":              "Iran",
+    "Republic of Ivory Coast":               "Ivory Coast",
+    "Côte d'Ivoire":                         "Ivory Coast",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -214,12 +233,15 @@ def _do_fetch_mv(player_id: str, player_name: str = '') -> dict | None:
         return None
 
 
-def _do_fetch_dob(player_id: str) -> str | None:
+def _do_fetch_profile(player_id: str, player_name: str = '') -> tuple[str | None, str | None]:
     """
-    Fetch exact DOB from the player profile HTML page.
-    Returns ISO date string "YYYY-MM-DD" or None (if page is blocked or DOB not found).
-    No retry — the profile page is consistently blocked; failure falls back to
-    _derive_birth_date() from MV history.
+    Fetch DOB and nationality from the Transfermarkt player profile page in a
+    single HTTP request.  Returns (dob_iso, country) — either may be None if
+    the page is blocked or the field is absent.
+
+    Single attempt, no retry: the profile page blocks like the schnellsuche
+    search page; retrying would extend the block window.  The caller falls back
+    to _derive_birth_date() for DOB and leaves country as NaN for the next run.
     """
     d = _current_domain
     url = f"https://www.{d}/-/profil/spieler/{player_id}"
@@ -227,36 +249,90 @@ def _do_fetch_dob(player_id: str) -> str | None:
         _sleep()
         resp = _get_session().get(url, timeout=15)
         if resp.status_code != 200:
-            return None
+            print(f"    [Profile {player_name}] {resp.status_code}")
+            return None, None
         soup = BeautifulSoup(resp.content, 'html.parser')
+
+        # -- DOB --
+        dob = None
         tag = soup.find(itemprop='birthDate')
-        if not tag:
-            return None
-        raw = tag.get_text(strip=True)
-        # Strip trailing age "(40)" if present
-        m = re.match(r'^(.+?)\s*\(\d+\)', raw)
-        dob_str = m.group(1).strip() if m else raw.strip()
-        d_obj = _parse_date_simple(dob_str)
-        return d_obj.isoformat() if d_obj else None
-    except Exception:
-        return None
+        if tag:
+            raw = tag.get_text(strip=True)
+            m = re.match(r'^(.+?)\s*\(\d+\)', raw)
+            dob_str = m.group(1).strip() if m else raw.strip()
+            d_obj = _parse_date_simple(dob_str)
+            dob = d_obj.isoformat() if d_obj else None
 
+        # -- Nationality: first flag image on the page = primary nationality --
+        country = None
+        flag = soup.find('img', class_='flaggenrahmen')
+        if flag:
+            country = flag.get('title')
 
-def _do_fetch_country(player_id: str, player_name: str = '') -> str | None:
-    """Fetch player nationality via the search endpoint — no profile HTML page needed."""
-    try:
-        results = TransfermarktPlayerSearch(query=player_name).search_players().get('results', [])
-        for r in results:
-            if str(r.get('id')) == str(player_id):
-                nats = r.get('nationalities', [])
-                return nats[0] if nats else None
-        if results:
-            nats = results[0].get('nationalities', [])
-            return nats[0] if nats else None
-        return None
+        return dob, country
     except Exception as e:
-        print(f"    [Country error] {_fmt_error(e)}")
-        return None
+        print(f"    [Profile error] {_fmt_error(e)}")
+        return None, None
+
+
+# ---------------------------------------------------------------------------
+# Wikidata bulk country lookup
+# ---------------------------------------------------------------------------
+
+def _fetch_countries_wikidata(player_ids: list[str]) -> dict[str, str]:
+    """
+    Bulk-fetch player nationalities from Wikidata via the free SPARQL endpoint,
+    using Transfermarkt player IDs (property P2446) as the lookup key.
+
+    Sends POST requests in batches of 200 to stay within URL/query size limits.
+    Returns {player_id_str: country_name}.  Players absent from Wikidata are
+    simply not included — the caller leaves their Country cell as NaN.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    ENDPOINT   = "https://query.wikidata.org/sparql"
+    BATCH_SIZE = 200
+
+    results: dict[str, str] = {}
+    total_batches = (len(player_ids) - 1) // BATCH_SIZE + 1
+
+    for batch_num, offset in enumerate(range(0, len(player_ids), BATCH_SIZE), start=1):
+        batch   = player_ids[offset : offset + BATCH_SIZE]
+        id_list = ", ".join(f'"{pid}"' for pid in batch)
+        query = (
+            "SELECT ?tmId ?nationalityLabel WHERE { "
+            "  ?player wdt:P2446 ?tmId . "
+            "  ?player wdt:P27 ?nationality . "
+            f" FILTER(?tmId IN ({id_list})) "
+            '  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
+            "}"
+        )
+        print(f"  [Wikidata] batch {batch_num}/{total_batches} ({len(batch)} IDs) …")
+        try:
+            body = urllib.parse.urlencode({"query": query, "format": "json"}).encode()
+            req  = urllib.request.Request(
+                ENDPOINT, data=body,
+                headers={
+                    "User-Agent":   "SoccerMVResearch/1.0 (academic)",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept":       "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read())
+            for row in data["results"]["bindings"]:
+                pid = row["tmId"]["value"]
+                nat = row.get("nationalityLabel", {}).get("value", "")
+                nat = _COUNTRY_NORM.get(nat, nat)
+                if pid not in results and nat:   # keep first nationality per player
+                    results[pid] = nat
+            time.sleep(1)  # polite pause between Wikidata batches
+        except Exception as e:
+            print(f"  [Wikidata error] batch {batch_num}: {e}")
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +365,12 @@ def process_year(year: int, limit: int | None = None) -> bool:
         if col not in df.columns:
             df[col] = None
 
+    # Cast profile columns to object dtype so pandas doesn't warn when
+    # writing date/country strings into an all-NaN float64 column.
+    for col in PROFILE_COLUMNS:
+        if df[col].dtype != object:
+            df[col] = df[col].astype(object)
+
     total = len(df)
 
     # ---- row-level fetch loop ----
@@ -303,6 +385,36 @@ def process_year(year: int, limit: int | None = None) -> bool:
     if mv_needed == 0 and country_needed == 0 and dob_needed == 0:
         print("  All data present. Nothing to do.")
         return True
+
+    # -- Bulk country fill from Wikidata (before row loop) --
+    # One SPARQL call per 200 players; no per-player HTTP overhead.
+    # Players absent from Wikidata stay NaN and fall through to the
+    # profile page attempt inside the row loop.
+    if country_needed > 0:
+        missing_ids = [
+            _player_id_str(r['Player ID'])
+            for _, r in df[df['Player Country'].isna()].iterrows()
+            if _player_id_str(r['Player ID']) is not None
+        ]
+        if missing_ids:
+            wikidata_map = _fetch_countries_wikidata(missing_ids)
+            filled = 0
+            for idx, row in df[df['Player Country'].isna()].iterrows():
+                pid = _player_id_str(row.get('Player ID'))
+                if pid and pid in wikidata_map:
+                    df.at[idx, 'Player Country'] = wikidata_map[pid]
+                    filled += 1
+            print(f"  Wikidata: filled {filled} / {len(missing_ids)} countries")
+            if filled:
+                df.to_excel(output_file, index=False)
+                print(f"  [checkpoint] saved Wikidata fill")
+
+        # Re-check — if Wikidata filled everything, skip the row loop entirely
+        country_needed = df['Player Country'].isna().sum()
+        if mv_needed == 0 and country_needed == 0 and dob_needed == 0:
+            print("  All data present after Wikidata fill. Nothing more to do.")
+            df.to_excel(output_file, index=False)
+            return True
 
     rows_since_save = 0
 
@@ -324,26 +436,33 @@ def process_year(year: int, limit: int | None = None) -> bool:
                 df.at[idx, MV_COLUMN] = result
                 needs_any = True
 
-        # -- date of birth: try profile page (exact); fall back to MV-derived estimate --
-        if pd.isna(row.get('Date of Birth')):
-            birth_date = None
-            if pid is not None:
-                print(f"  [{pos}/{total}] DOB   {name} (ID {pid})")
-                birth_date = _do_fetch_dob(pid)
-            if not birth_date:
-                birth_date = _derive_birth_date(df.at[idx, MV_COLUMN])
+        # -- profile page: DOB + Country fallback (single request, no retry) --
+        # Called only when the profile page can provide something Wikidata/MV can't:
+        #   • DOB is missing AND MV history is absent  (can't derive without MV)
+        #   • Country is still NaN after the Wikidata bulk fill above
+        # Profile page is behind AWS WAF so expect frequent 405s; failure is
+        # silent — DOB falls back to MV derivation, Country stays NaN for retry.
+        dob_missing     = pd.isna(row.get('Date of Birth'))
+        country_missing = pd.isna(row.get('Player Country'))
+        mv_present      = not pd.isna(df.at[idx, MV_COLUMN])
+
+        profile_dob, profile_country = None, None
+        need_profile = (dob_missing and not mv_present) or country_missing
+        if need_profile and pid is not None:
+            print(f"  [{pos}/{total}] Profile  {name} (ID {pid})")
+            profile_dob, profile_country = _do_fetch_profile(pid, name)
+
+        if dob_missing:
+            birth_date = profile_dob or _derive_birth_date(df.at[idx, MV_COLUMN])
             if birth_date:
                 df.at[idx, 'Date of Birth'] = birth_date
                 needs_any = True
 
-        # -- player country (via search endpoint) --
-        if pd.isna(row.get('Player Country')):
+        if country_missing:
             if pid is None:
                 df.at[idx, 'Player Country'] = None
-            else:
-                print(f"  [{pos}/{total}] Country  {name} (ID {pid})")
-                country = _fetch_with_retry(_do_fetch_country, pid, name)
-                df.at[idx, 'Player Country'] = country
+            elif profile_country:
+                df.at[idx, 'Player Country'] = profile_country
                 needs_any = True
 
         if needs_any:
