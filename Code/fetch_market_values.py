@@ -279,14 +279,15 @@ def _do_fetch_profile(player_id: str, player_name: str = '') -> tuple[str | None
 # Wikidata bulk country lookup
 # ---------------------------------------------------------------------------
 
-def _fetch_countries_wikidata(player_ids: list[str]) -> dict[str, str]:
+def _fetch_wikidata(player_ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
     """
-    Bulk-fetch player nationalities from Wikidata via the free SPARQL endpoint,
-    using Transfermarkt player IDs (property P2446) as the lookup key.
+    Bulk-fetch player nationality (P27) and date of birth (P569) from Wikidata
+    via the free SPARQL endpoint, keyed by Transfermarkt player ID (P2446).
 
-    Sends POST requests in batches of 200 to stay within URL/query size limits.
-    Returns {player_id_str: country_name}.  Players absent from Wikidata are
-    simply not included — the caller leaves their Country cell as NaN.
+    Sends POST requests in batches of 200.
+    Returns (countries, dobs) — both are {player_id_str: value} dicts.
+    Players absent from Wikidata are simply not included in the dicts.
+    DOB is returned as an ISO date string "YYYY-MM-DD".
     """
     import json
     import urllib.parse
@@ -295,16 +296,18 @@ def _fetch_countries_wikidata(player_ids: list[str]) -> dict[str, str]:
     ENDPOINT   = "https://query.wikidata.org/sparql"
     BATCH_SIZE = 200
 
-    results: dict[str, str] = {}
+    countries: dict[str, str] = {}
+    dobs:      dict[str, str] = {}
     total_batches = (len(player_ids) - 1) // BATCH_SIZE + 1
 
     for batch_num, offset in enumerate(range(0, len(player_ids), BATCH_SIZE), start=1):
         batch   = player_ids[offset : offset + BATCH_SIZE]
         id_list = ", ".join(f'"{pid}"' for pid in batch)
         query = (
-            "SELECT ?tmId ?nationalityLabel WHERE { "
+            "SELECT ?tmId ?nationalityLabel ?dob WHERE { "
             "  ?player wdt:P2446 ?tmId . "
-            "  ?player wdt:P27 ?nationality . "
+            "  OPTIONAL { ?player wdt:P27 ?nationality . } "
+            "  OPTIONAL { ?player wdt:P569 ?dob . } "
             f" FILTER(?tmId IN ({id_list})) "
             '  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
             "}"
@@ -326,13 +329,16 @@ def _fetch_countries_wikidata(player_ids: list[str]) -> dict[str, str]:
                 pid = row["tmId"]["value"]
                 nat = row.get("nationalityLabel", {}).get("value", "")
                 nat = _COUNTRY_NORM.get(nat, nat)
-                if pid not in results and nat:   # keep first nationality per player
-                    results[pid] = nat
+                if pid not in countries and nat:
+                    countries[pid] = nat
+                dob_raw = row.get("dob", {}).get("value", "")
+                if dob_raw and pid not in dobs:
+                    dobs[pid] = dob_raw[:10]   # "1992-10-02T00:00:00Z" → "1992-10-02"
             time.sleep(1)  # polite pause between Wikidata batches
         except Exception as e:
             print(f"  [Wikidata error] batch {batch_num}: {e}")
 
-    return results
+    return countries, dobs
 
 
 # ---------------------------------------------------------------------------
@@ -386,34 +392,41 @@ def process_year(year: int, limit: int | None = None) -> bool:
         print("  All data present. Nothing to do.")
         return True
 
-    # -- Bulk country fill from Wikidata (before row loop) --
+    # -- Bulk Country + DOB fill from Wikidata (before row loop) --
     # One SPARQL call per 200 players; no per-player HTTP overhead.
-    # Players absent from Wikidata stay NaN and fall through to the
-    # profile page attempt inside the row loop.
-    if country_needed > 0:
-        missing_ids = [
+    # Exact birth dates (P569) are better than MV-derived estimates.
+    # Players absent from Wikidata fall through to MV derivation (DOB)
+    # or the profile page fallback (both) inside the row loop.
+    if country_needed > 0 or dob_needed > 0:
+        missing_mask = df['Player Country'].isna() | df['Date of Birth'].isna()
+        wikidata_ids = list({
             _player_id_str(r['Player ID'])
-            for _, r in df[df['Player Country'].isna()].iterrows()
+            for _, r in df[missing_mask].iterrows()
             if _player_id_str(r['Player ID']) is not None
-        ]
-        if missing_ids:
-            wikidata_map = _fetch_countries_wikidata(missing_ids)
-            filled = 0
-            for idx, row in df[df['Player Country'].isna()].iterrows():
+        })
+        if wikidata_ids:
+            wikidata_countries, wikidata_dobs = _fetch_wikidata(wikidata_ids)
+            c_filled = dob_filled = 0
+            for idx, row in df[missing_mask].iterrows():
                 pid = _player_id_str(row.get('Player ID'))
-                if pid and pid in wikidata_map:
-                    df.at[idx, 'Player Country'] = wikidata_map[pid]
-                    filled += 1
-            print(f"  Wikidata: filled {filled} / {len(missing_ids)} countries")
-            if filled:
+                if not pid:
+                    continue
+                if pd.isna(row.get('Player Country')) and pid in wikidata_countries:
+                    df.at[idx, 'Player Country'] = wikidata_countries[pid]
+                    c_filled += 1
+                if pd.isna(row.get('Date of Birth')) and pid in wikidata_dobs:
+                    df.at[idx, 'Date of Birth'] = wikidata_dobs[pid]
+                    dob_filled += 1
+            print(f"  Wikidata: filled {c_filled} countries, {dob_filled} DOBs")
+            if c_filled or dob_filled:
                 df.to_excel(output_file, index=False)
                 print(f"  [checkpoint] saved Wikidata fill")
 
         # Re-check — if Wikidata filled everything, skip the row loop entirely
         country_needed = df['Player Country'].isna().sum()
+        dob_needed     = df['Date of Birth'].isna().sum()
         if mv_needed == 0 and country_needed == 0 and dob_needed == 0:
             print("  All data present after Wikidata fill. Nothing more to do.")
-            df.to_excel(output_file, index=False)
             return True
 
     rows_since_save = 0
