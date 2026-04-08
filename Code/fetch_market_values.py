@@ -371,9 +371,10 @@ def process_year(year: int, limit: int | None = None) -> bool:
         if col not in df.columns:
             df[col] = None
 
-    # Cast profile columns to object dtype so pandas doesn't warn when
-    # writing date/country strings into an all-NaN float64 column.
-    for col in PROFILE_COLUMNS:
+    # Cast all target columns to object dtype so pandas doesn't raise
+    # "Incompatible indexer with Series" when assigning dicts (MV) or
+    # strings (Country/DOB) into a freshly-created all-NaN float64 column.
+    for col in [MV_COLUMN] + PROFILE_COLUMNS:
         if df[col].dtype != object:
             df[col] = df[col].astype(object)
 
