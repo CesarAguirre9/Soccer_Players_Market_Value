@@ -21,6 +21,7 @@ Added / filled columns:
   - Market Value History  (full dict from TransfermarktPlayerMarketValue)
   - Player Country        (first citizenship entry from player profile)
   - Date of Birth         (dateOfBirth string from player profile)
+  - National Team         (country the player represents in international football; Wikidata P1532)
 
 Usage:
     py Code/fetch_market_values.py                # all years 2018-2025
@@ -61,7 +62,7 @@ SAVE_EVERY            = 20    # write to disk after this many players
 # ----------------------------------
 
 MV_COLUMN       = 'Market Value History'
-PROFILE_COLUMNS = ['Player Country', 'Date of Birth']
+PROFILE_COLUMNS = ['Player Country', 'Date of Birth', 'National Team']
 
 # Wikidata sometimes returns long official country names; map them to the short
 # form used everywhere else in this dataset.
@@ -217,6 +218,84 @@ def _derive_birth_date(mv_raw) -> str | None:
     return f"{birth_year}-07-01"
 
 
+# ---------------------------------------------------------------------------
+# Cross-year player cache
+# ---------------------------------------------------------------------------
+
+def _build_player_cache(current_year: int) -> dict[str, dict]:
+    """
+    Scan all _with_market_values.xlsx sibling files and build a per-player
+    data cache for offline pre-filling.
+
+    Files are read newest-first.  For each player, the first non-null value
+    found wins (i.e. the newest source year), then older files are skipped
+    for that field.
+
+    Country and DOB are static per player — copied from any sibling year.
+    MV History is only copied from files where source_year > current_year.
+    A newer year's history is always a superset of any older year's, so it
+    covers the current year's window without needing a fresh API call.
+    An older year's history may be missing entries for the target season —
+    those rows are left null so a fresh API call fills them when online.
+
+    Returns {player_id_str: {col: value}} with only non-null values included.
+    """
+    cache: dict[str, dict] = {}
+    files = sorted(DATA_DIR.glob('UEFA Stats *_with_market_values.xlsx'), reverse=True)
+    loaded: list[str] = []
+
+    for filepath in files:
+        m = re.search(r'UEFA Stats (\d{4})_with_market_values', filepath.name)
+        if not m:
+            continue
+        source_year = int(m.group(1))
+        if source_year == current_year:
+            continue
+        try:
+            src_df = pd.read_excel(filepath)
+        except Exception as e:
+            print(f"  [cache] Could not read {filepath.name}: {e}")
+            continue
+
+        mv_eligible = source_year > current_year
+        for _, row in src_df.iterrows():
+            pid = _player_id_str(row.get('Player ID'))
+            if not pid:
+                continue
+            entry = cache.setdefault(pid, {})
+
+            if 'Player Country' not in entry:
+                country = row.get('Player Country')
+                if not pd.isna(country) and country:
+                    entry['Player Country'] = str(country)
+
+            if 'Date of Birth' not in entry:
+                dob = row.get('Date of Birth')
+                if not pd.isna(dob) and dob:
+                    # Excel may read ISO date strings back as datetime objects
+                    if hasattr(dob, 'strftime'):
+                        dob = dob.strftime('%Y-%m-%d')
+                    entry['Date of Birth'] = str(dob)
+
+            if 'National Team' not in entry:
+                nt = row.get('National Team')
+                if not pd.isna(nt) and nt:
+                    entry['National Team'] = str(nt)
+
+            if mv_eligible and MV_COLUMN not in entry:
+                mv = row.get(MV_COLUMN)
+                if not pd.isna(mv) and mv:
+                    entry[MV_COLUMN] = mv
+
+        loaded.append(f"{source_year}({'MV+' if mv_eligible else 'C/D'})")
+
+    if loaded:
+        print(f"  [cache] Loaded: {', '.join(loaded)} → {len(cache)} unique players")
+    else:
+        print(f"  [cache] No sibling year files found")
+    return cache
+
+
 def _do_fetch_mv(player_id: str, player_name: str = '') -> dict | None:
     """Fetch MV history directly from the ceapi JSON endpoint — no HTML page needed."""
     d = _current_domain
@@ -233,15 +312,20 @@ def _do_fetch_mv(player_id: str, player_name: str = '') -> dict | None:
         return None
 
 
-def _do_fetch_profile(player_id: str, player_name: str = '') -> tuple[str | None, str | None]:
+def _do_fetch_profile(player_id: str, player_name: str = '') -> tuple[str | None, str | None, str | None]:
     """
-    Fetch DOB and nationality from the Transfermarkt player profile page in a
-    single HTTP request.  Returns (dob_iso, country) — either may be None if
-    the page is blocked or the field is absent.
+    Fetch DOB, nationality, and national team from the Transfermarkt player
+    profile page in a single HTTP request.
+    Returns (dob_iso, country, national_team) — any may be None if the page is
+    blocked or the field is absent.
 
     Single attempt, no retry: the profile page blocks like the schnellsuche
     search page; retrying would extend the block window.  The caller falls back
-    to _derive_birth_date() for DOB and leaves country as NaN for the next run.
+    to _derive_birth_date() for DOB and leaves country/national_team as NaN.
+
+    National team is identified by finding the first <a> whose href contains
+    '/nationalteam/' or '/nationalmannschaft/' in the career stats section of
+    the page — that link's text is the national team name.
     """
     d = _current_domain
     url = f"https://www.{d}/-/profil/spieler/{player_id}"
@@ -250,7 +334,7 @@ def _do_fetch_profile(player_id: str, player_name: str = '') -> tuple[str | None
         resp = _get_session().get(url, timeout=15)
         if resp.status_code != 200:
             print(f"    [Profile {player_name}] {resp.status_code}")
-            return None, None
+            return None, None, None
         soup = BeautifulSoup(resp.content, 'html.parser')
 
         # -- DOB --
@@ -269,23 +353,40 @@ def _do_fetch_profile(player_id: str, player_name: str = '') -> tuple[str | None
         if flag:
             country = flag.get('title')
 
-        return dob, country
+        # -- National team: first career-stats link pointing to a national team URL --
+        national_team = None
+        for a in soup.find_all('a', href=True):
+            href = a['href']
+            if '/nationalteam/' in href or '/nationalmannschaft/' in href:
+                name_text = a.get_text(strip=True)
+                if name_text:
+                    national_team = _COUNTRY_NORM.get(name_text, name_text)
+                    break
+
+        return dob, country, national_team
     except Exception as e:
         print(f"    [Profile error] {_fmt_error(e)}")
-        return None, None
+        return None, None, None
 
 
 # ---------------------------------------------------------------------------
 # Wikidata bulk country lookup
 # ---------------------------------------------------------------------------
 
-def _fetch_wikidata(player_ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
+def _fetch_wikidata(player_ids: list[str]) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
     """
-    Bulk-fetch player nationality (P27) and date of birth (P569) from Wikidata
-    via the free SPARQL endpoint, keyed by Transfermarkt player ID (P2446).
+    Bulk-fetch player nationality (P27), date of birth (P569), and international
+    football team (P1532 — "country for sport") from Wikidata via the free SPARQL
+    endpoint, keyed by Transfermarkt player ID (P2446).
+
+    P27  = country of citizenship  → stored as "Player Country"
+    P569 = date of birth           → stored as "Date of Birth"
+    P1532= country for sport       → stored as "National Team"
+           (the country the player *represents* in international football;
+            differs from citizenship for e.g. players who switched allegiance)
 
     Sends POST requests in batches of 200.
-    Returns (countries, dobs) — both are {player_id_str: value} dicts.
+    Returns (countries, dobs, national_teams) — all {player_id_str: value} dicts.
     Players absent from Wikidata are simply not included in the dicts.
     DOB is returned as an ISO date string "YYYY-MM-DD".
     """
@@ -296,18 +397,20 @@ def _fetch_wikidata(player_ids: list[str]) -> tuple[dict[str, str], dict[str, st
     ENDPOINT   = "https://query.wikidata.org/sparql"
     BATCH_SIZE = 200
 
-    countries: dict[str, str] = {}
-    dobs:      dict[str, str] = {}
+    countries:     dict[str, str] = {}
+    dobs:          dict[str, str] = {}
+    national_teams: dict[str, str] = {}
     total_batches = (len(player_ids) - 1) // BATCH_SIZE + 1
 
     for batch_num, offset in enumerate(range(0, len(player_ids), BATCH_SIZE), start=1):
         batch   = player_ids[offset : offset + BATCH_SIZE]
         id_list = ", ".join(f'"{pid}"' for pid in batch)
         query = (
-            "SELECT ?tmId ?nationalityLabel ?dob WHERE { "
+            "SELECT ?tmId ?nationalityLabel ?dob ?natTeamLabel WHERE { "
             "  ?player wdt:P2446 ?tmId . "
             "  OPTIONAL { ?player wdt:P27 ?nationality . } "
             "  OPTIONAL { ?player wdt:P569 ?dob . } "
+            "  OPTIONAL { ?player wdt:P1532 ?natTeam . } "
             f" FILTER(?tmId IN ({id_list})) "
             '  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
             "}"
@@ -334,18 +437,22 @@ def _fetch_wikidata(player_ids: list[str]) -> tuple[dict[str, str], dict[str, st
                 dob_raw = row.get("dob", {}).get("value", "")
                 if dob_raw and pid not in dobs:
                     dobs[pid] = dob_raw[:10]   # "1992-10-02T00:00:00Z" → "1992-10-02"
+                nt = row.get("natTeamLabel", {}).get("value", "")
+                nt = _COUNTRY_NORM.get(nt, nt)
+                if pid not in national_teams and nt:
+                    national_teams[pid] = nt
             time.sleep(1)  # polite pause between Wikidata batches
         except Exception as e:
             print(f"  [Wikidata error] batch {batch_num}: {e}")
 
-    return countries, dobs
+    return countries, dobs, national_teams
 
 
 # ---------------------------------------------------------------------------
 # Per-year processing
 # ---------------------------------------------------------------------------
 
-def process_year(year: int, limit: int | None = None) -> bool:
+def process_year(year: int, limit: int | None = None, offline: bool = False) -> bool:
     input_file  = DATA_DIR / f'UEFA Stats {year}_with_IDs.xlsx'
     output_file = DATA_DIR / f'UEFA Stats {year}_with_market_values.xlsx'
 
@@ -380,34 +487,74 @@ def process_year(year: int, limit: int | None = None) -> bool:
 
     total = len(df)
 
+    # -- Cross-year cache fill (zero network: reads local xlsx files only) --
+    # Country and DOB are static per player; reuse from any sibling year.
+    # MV History reused only from newer years (their history is a superset).
+    cache = _build_player_cache(year)
+    if cache:
+        c_mv = c_country = c_dob = c_nt = 0
+        for idx, row in df.iterrows():
+            pid = _player_id_str(row.get('Player ID'))
+            if not pid or pid not in cache:
+                continue
+            entry = cache[pid]
+            if pd.isna(row.get(MV_COLUMN)) and MV_COLUMN in entry:
+                df.at[idx, MV_COLUMN] = entry[MV_COLUMN]
+                c_mv += 1
+            if pd.isna(row.get('Player Country')) and 'Player Country' in entry:
+                df.at[idx, 'Player Country'] = entry['Player Country']
+                c_country += 1
+            if pd.isna(row.get('Date of Birth')) and 'Date of Birth' in entry:
+                df.at[idx, 'Date of Birth'] = entry['Date of Birth']
+                c_dob += 1
+            if pd.isna(row.get('National Team')) and 'National Team' in entry:
+                df.at[idx, 'National Team'] = entry['National Team']
+                c_nt += 1
+        if c_mv or c_country or c_dob or c_nt:
+            print(f"  Cache fill: MV={c_mv}, Country={c_country}, DOB={c_dob}, NationalTeam={c_nt}")
+            df.to_excel(output_file, index=False)
+            print(f"  [checkpoint] saved cross-year cache fill")
+
     # ---- row-level fetch loop ----
     # Only fetch what is currently null; already-filled cells are left alone.
     # This is what makes every restart truly resumable at the row level.
     mv_needed      = df[MV_COLUMN].isna().sum()
     country_needed = df['Player Country'].isna().sum()
     dob_needed     = df['Date of Birth'].isna().sum()
+    nt_needed      = df['National Team'].isna().sum()
 
-    print(f"  Still needed: MV={mv_needed}, Country={country_needed}, DOB={dob_needed}")
+    print(f"  Still needed: MV={mv_needed}, Country={country_needed}, DOB={dob_needed}, NationalTeam={nt_needed}")
 
-    if mv_needed == 0 and country_needed == 0 and dob_needed == 0:
+    if mv_needed == 0 and country_needed == 0 and dob_needed == 0 and nt_needed == 0:
         print("  All data present. Nothing to do.")
         return True
 
-    # -- Bulk Country + DOB fill from Wikidata (before row loop) --
+    if offline:
+        print(f"  [offline] Skipping API calls. Run without --offline to complete.")
+        return True
+
+    # -- Bulk Country + DOB + National Team fill from Wikidata (before row loop) --
     # One SPARQL call per 200 players; no per-player HTTP overhead.
     # Exact birth dates (P569) are better than MV-derived estimates.
+    # National Team (P1532) gives the country the player represents in football,
+    # which may differ from citizenship (e.g. Deco: citizenship=Portugal+Brazil,
+    # national team=Portugal).
     # Players absent from Wikidata fall through to MV derivation (DOB)
     # or the profile page fallback (both) inside the row loop.
-    if country_needed > 0 or dob_needed > 0:
-        missing_mask = df['Player Country'].isna() | df['Date of Birth'].isna()
+    if country_needed > 0 or dob_needed > 0 or nt_needed > 0:
+        missing_mask = (
+            df['Player Country'].isna() |
+            df['Date of Birth'].isna() |
+            df['National Team'].isna()
+        )
         wikidata_ids = list({
             _player_id_str(r['Player ID'])
             for _, r in df[missing_mask].iterrows()
             if _player_id_str(r['Player ID']) is not None
         })
         if wikidata_ids:
-            wikidata_countries, wikidata_dobs = _fetch_wikidata(wikidata_ids)
-            c_filled = dob_filled = 0
+            wikidata_countries, wikidata_dobs, wikidata_nt = _fetch_wikidata(wikidata_ids)
+            c_filled = dob_filled = nt_filled = 0
             for idx, row in df[missing_mask].iterrows():
                 pid = _player_id_str(row.get('Player ID'))
                 if not pid:
@@ -418,15 +565,19 @@ def process_year(year: int, limit: int | None = None) -> bool:
                 if pd.isna(row.get('Date of Birth')) and pid in wikidata_dobs:
                     df.at[idx, 'Date of Birth'] = wikidata_dobs[pid]
                     dob_filled += 1
-            print(f"  Wikidata: filled {c_filled} countries, {dob_filled} DOBs")
-            if c_filled or dob_filled:
+                if pd.isna(row.get('National Team')) and pid in wikidata_nt:
+                    df.at[idx, 'National Team'] = wikidata_nt[pid]
+                    nt_filled += 1
+            print(f"  Wikidata: filled {c_filled} countries, {dob_filled} DOBs, {nt_filled} national teams")
+            if c_filled or dob_filled or nt_filled:
                 df.to_excel(output_file, index=False)
                 print(f"  [checkpoint] saved Wikidata fill")
 
         # Re-check — if Wikidata filled everything, skip the row loop entirely
         country_needed = df['Player Country'].isna().sum()
         dob_needed     = df['Date of Birth'].isna().sum()
-        if mv_needed == 0 and country_needed == 0 and dob_needed == 0:
+        nt_needed      = df['National Team'].isna().sum()
+        if mv_needed == 0 and country_needed == 0 and dob_needed == 0 and nt_needed == 0:
             print("  All data present after Wikidata fill. Nothing more to do.")
             return True
 
@@ -450,21 +601,23 @@ def process_year(year: int, limit: int | None = None) -> bool:
                 df.at[idx, MV_COLUMN] = result
                 needs_any = True
 
-        # -- profile page: DOB + Country fallback (single request, no retry) --
+        # -- profile page: DOB + Country + National Team fallback (single request, no retry) --
         # Called only when the profile page can provide something Wikidata/MV can't:
         #   • DOB is missing AND MV history is absent  (can't derive without MV)
         #   • Country is still NaN after the Wikidata bulk fill above
+        #   • National Team is still NaN after the Wikidata bulk fill above
         # Profile page is behind AWS WAF so expect frequent 405s; failure is
-        # silent — DOB falls back to MV derivation, Country stays NaN for retry.
+        # silent — DOB falls back to MV derivation, Country/NationalTeam stay NaN for retry.
         dob_missing     = pd.isna(row.get('Date of Birth'))
         country_missing = pd.isna(row.get('Player Country'))
+        nt_missing      = pd.isna(row.get('National Team'))
         mv_present      = not pd.isna(df.at[idx, MV_COLUMN])
 
-        profile_dob, profile_country = None, None
-        need_profile = (dob_missing and not mv_present) or country_missing
+        profile_dob, profile_country, profile_nt = None, None, None
+        need_profile = (dob_missing and not mv_present) or country_missing or nt_missing
         if need_profile and pid is not None:
             print(f"  [{pos}/{total}] Profile  {name} (ID {pid})")
-            profile_dob, profile_country = _do_fetch_profile(pid, name)
+            profile_dob, profile_country, profile_nt = _do_fetch_profile(pid, name)
 
         if dob_missing:
             birth_date = profile_dob or _derive_birth_date(df.at[idx, MV_COLUMN])
@@ -479,6 +632,13 @@ def process_year(year: int, limit: int | None = None) -> bool:
                 df.at[idx, 'Player Country'] = profile_country
                 needs_any = True
 
+        if nt_missing:
+            if pid is None:
+                df.at[idx, 'National Team'] = None
+            elif profile_nt:
+                df.at[idx, 'National Team'] = profile_nt
+                needs_any = True
+
         if needs_any:
             rows_since_save += 1
             if rows_since_save >= SAVE_EVERY:
@@ -491,7 +651,8 @@ def process_year(year: int, limit: int | None = None) -> bool:
     mv_done  = df[MV_COLUMN].notna().sum()
     pc_done  = df['Player Country'].notna().sum()
     dob_done = df['Date of Birth'].notna().sum()
-    print(f"\n  Done. MV={mv_done}/{total}, Country={pc_done}/{total}, DOB={dob_done}/{total}")
+    nt_done  = df['National Team'].notna().sum()
+    print(f"\n  Done. MV={mv_done}/{total}, Country={pc_done}/{total}, DOB={dob_done}/{total}, NationalTeam={nt_done}/{total}")
     print(f"  Saved: {output_file.name}")
     return True
 
@@ -506,17 +667,21 @@ def main():
                         help='Years to process (default: 2018-2025)')
     parser.add_argument('--limit', type=int, default=None,
                         help='Stop after processing this many rows per year (for testing)')
+    parser.add_argument('--offline', action='store_true',
+                        help='Cache-only: fill from sibling year files, skip all API calls')
     args = parser.parse_args()
 
     print("Transfermarkt data fetcher (resumable, rate-limited)")
     print(f"Request delay: {REQUEST_DELAY_SECONDS}s + up to {DELAY_JITTER}s jitter")
     print(f"Max retries: {MAX_RETRIES}  |  Save every: {SAVE_EVERY} players")
+    if args.offline:
+        print("Mode: OFFLINE (cache fill only — no API calls)")
     print(f"Years: {args.years}\n")
 
     results = {}
     for year in args.years:
         try:
-            results[year] = process_year(year, limit=args.limit)
+            results[year] = process_year(year, limit=args.limit, offline=args.offline)
         except Exception as e:
             print(f"ERROR on year {year}: {e}")
             results[year] = False
