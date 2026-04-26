@@ -1,16 +1,24 @@
 """
 Validate and auto-correct player IDs in UEFA Stats _with_IDs.xlsx files.
 
-For each player-year:
-  1. Look up market value history for the assigned ID
-     (from existing _with_market_values.xlsx if available — free; else fetch from API)
-  2. Check if any snapshot dated in [year-1, year] has a clubName that fuzzy-matches
-     the expected Team column (threshold 65%)
-  3. On mismatch: search top 5 Transfermarkt candidates, re-check each
-  4. Auto-correct if a better match is found; flag NEEDS_REVIEW if not
-  5. Null out the Market Value History cell in _with_market_values.xlsx for any
-     row whose ID changed (so fetch_market_values.py re-fetches it)
-  6. Append all changes to Data/Corrections_Log.xlsx
+For each player-year three signals are checked against the assigned ID:
+  1. Club name   — a snapshot in [year-1, year] must fuzzy-match the Team column (≥65%)
+  2. Activity    — the player must have at least one MV snapshot in [year-1, year]
+  3. Position    — the player's Transfermarkt position (broad category) must match
+                   the UEFA Position column (Goalkeeper/Defender/Midfielder/Forward)
+
+A player passes only when ALL three signals agree. On any failure the top-N
+Transfermarkt search candidates are evaluated with the same three signals and the
+best-scoring active, position-compatible candidate is auto-corrected.
+
+Steps:
+  1. Look up market value history (from _with_market_values.xlsx cache if available,
+     else fetch from ceapi)
+  2. Search Transfermarkt by player name → get candidates + current ID's TM position
+  3. Check all three signals for the current ID
+  4. On mismatch: re-check each candidate; auto-correct if a better match found
+  5. Null out Market Value History for any row whose ID changed (triggers re-fetch)
+  6. Append all results to Data/Corrections_Log.xlsx
 
 Usage:
     py Code/validate_player_ids.py                      # all years 2018-2025
@@ -81,6 +89,38 @@ TEAM_NORMALIZATION: dict[str, str] = {
     "Feyenoord":         "Feyenoord Rotterdam",
 }
 
+# Transfermarkt granular position → broad category used by UEFA data.
+# UEFA already stores Goalkeeper / Defender / Midfielder / Forward directly.
+TM_POSITION_MAP: dict[str, str] = {
+    # Goalkeepers
+    "Goalkeeper":          "Goalkeeper",
+    # Defenders
+    "Centre-Back":         "Defender",
+    "Left-Back":           "Defender",
+    "Right-Back":          "Defender",
+    "Left Back":           "Defender",
+    "Right Back":          "Defender",
+    "Centre Back":         "Defender",
+    "Sweeper":             "Defender",
+    "Defender":            "Defender",
+    # Midfielders
+    "Defensive Midfield":  "Midfielder",
+    "Central Midfield":    "Midfielder",
+    "Attacking Midfield":  "Midfielder",
+    "Left Midfield":       "Midfielder",
+    "Right Midfield":      "Midfielder",
+    "Midfielder":          "Midfielder",
+    # Forwards
+    "Centre-Forward":      "Forward",
+    "Left Winger":         "Forward",
+    "Right Winger":        "Forward",
+    "Second Striker":      "Forward",
+    "Forward":             "Forward",
+    "Attack":              "Forward",
+}
+
+_UEFA_BROAD = {"Goalkeeper", "Defender", "Midfielder", "Forward"}
+
 
 # ---------------------------------------------------------------------------
 # Helpers — market value history parsing (mirrors compile_dataset.py)
@@ -122,6 +162,37 @@ def _club_similarity(club_a: str, club_b: str) -> float:
     a = _normalize_team(club_a).lower()
     b = _normalize_team(club_b).lower()
     return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def _broad_position(pos_str: str | None) -> str | None:
+    """Map any position string (UEFA or TM) to Goalkeeper/Defender/Midfielder/Forward."""
+    if not pos_str:
+        return None
+    norm = str(pos_str).strip()
+    if norm in _UEFA_BROAD:
+        return norm
+    return TM_POSITION_MAP.get(norm)
+
+
+def _positions_compatible(tm_pos: str | None, uefa_pos: str | None) -> bool | None:
+    """
+    Compare TM and UEFA position broad categories.
+    Returns True (match), False (clear mismatch), or None (either side unknown → skip).
+    """
+    broad_tm   = _broad_position(tm_pos)
+    broad_uefa = _broad_position(uefa_pos)
+    if broad_tm is None or broad_uefa is None:
+        return None
+    return broad_tm == broad_uefa
+
+
+def _has_activity(history: list, start_year: int, end_year: int) -> bool:
+    """True if at least one MV snapshot falls within [start_year, end_year]."""
+    for entry in history:
+        d = _parse_date(entry.get('date', ''))
+        if d and start_year <= d.year <= end_year:
+            return True
+    return False
 
 
 def _id_str(raw) -> str | None:
@@ -176,68 +247,134 @@ def best_club_match_score(history: list, team: str, start_year: int, end_year: i
 
 
 def validate_player(player_name: str, team: str, player_id: str,
-                    year: int, existing_history: list | None) -> dict:
+                    year: int, existing_history: list | None,
+                    uefa_position: str | None = None) -> dict:
     """
-    Validate one player's assigned ID.
+    Validate one player's assigned ID against three signals:
+      1. Club name   — MV snapshot in [year-1, year] fuzzy-matches Team (≥65%)
+      2. Activity    — at least one MV snapshot exists in [year-1, year]
+      3. Position    — TM broad category matches UEFA Position column
 
     Returns a result dict:
         status         : 'VALID' | 'AUTO_CORRECTED' | 'NEEDS_REVIEW'
-        old_id         : the ID that was checked
-        new_id         : corrected ID (same as old_id if VALID/NEEDS_REVIEW)
-        score          : best club-match score found
-        alt_club       : best matching club name from history
+        old_id / new_id
+        score          : best club-match score
         confidence     : 'HIGH' | 'MEDIUM' | 'LOW'
+        activity_ok    : bool
+        position_check : True | False | None  (None = position unknown, check skipped)
+        tm_position    : raw TM position string for the accepted ID
+        uefa_position  : the UEFA Position column value passed in
     """
     start_year = year - 1
     end_year   = year
 
-    # Step 1: get history (free if pre-loaded, else fetch)
+    # Step 1: get MV history (free if pre-loaded, else fetch)
     if existing_history is not None:
         history = existing_history
     else:
         print(f"    Fetching MV history for {player_name} (ID: {player_id})...")
         history = fetch_mv_history(player_id)
 
-    # Step 2: validate current ID
-    score = best_club_match_score(history, team, start_year, end_year)
+    # Step 2: search by name — gives us candidates AND the current ID's TM position
+    candidates  = search_candidates(player_name)
+    tm_position = next(
+        (c.get('position') for c in candidates if str(c.get('id', '')) == player_id),
+        None,
+    )
 
-    if score >= MATCH_THRESHOLD:
+    # Step 3: evaluate all three signals for the current ID
+    club_score  = best_club_match_score(history, team, start_year, end_year)
+    activity_ok = _has_activity(history, start_year, end_year)
+    pos_check   = _positions_compatible(tm_position, uefa_position)
+
+    all_pass = (
+        club_score  >= MATCH_THRESHOLD
+        and activity_ok
+        and pos_check is not False
+    )
+
+    if all_pass:
         return {
             'status': 'VALID', 'old_id': player_id, 'new_id': player_id,
-            'score': score, 'confidence': 'HIGH' if score >= 0.85 else 'MEDIUM',
+            'score': club_score,
+            'confidence':     'HIGH' if club_score >= 0.85 else 'MEDIUM',
+            'activity_ok':    activity_ok,
+            'position_check': pos_check,
+            'tm_position':    tm_position,
+            'uefa_position':  uefa_position,
         }
 
-    # Step 3: mismatch — search for alternatives
-    print(f"    MISMATCH: {player_name} ({team} {year}) ID={player_id}  club_score={score:.2f}")
-    candidates = search_candidates(player_name)
+    # Step 4: mismatch — log why, then evaluate candidates
+    fail_reasons = []
+    if club_score < MATCH_THRESHOLD:
+        fail_reasons.append(f"club_score={club_score:.2f}")
+    if not activity_ok:
+        fail_reasons.append("no_activity_in_window")
+    if pos_check is False:
+        fail_reasons.append(
+            f"position_mismatch(UEFA={_broad_position(uefa_position)}"
+            f",TM={_broad_position(tm_position)})"
+        )
+    print(f"    MISMATCH: {player_name} ({team} {year}) ID={player_id}"
+          f"  [{', '.join(fail_reasons)}]")
 
     best_candidate_id    = None
     best_candidate_score = 0.0
+    best_cand_activity   = False
+    best_cand_pos_check  = None
+    best_cand_tm_pos     = None
 
     for cand in candidates:
         cand_id = cand.get('id')
         if not cand_id or cand_id == player_id:
             continue
-        print(f"      Checking candidate: {cand.get('name')} (ID: {cand_id}, club: {cand.get('club',{}).get('name','')})")
-        cand_history = fetch_mv_history(cand_id)
-        cand_score   = best_club_match_score(cand_history, team, start_year, end_year)
-        print(f"        club match score: {cand_score:.2f}")
+        cand_tm_pos = cand.get('position')
+        cand_pos_check = _positions_compatible(cand_tm_pos, uefa_position)
+
+        print(f"      Checking candidate: {cand.get('name')} "
+              f"(ID: {cand_id}, club: {cand.get('club', {}).get('name', '')}, "
+              f"pos: {cand_tm_pos})")
+
+        cand_history  = fetch_mv_history(cand_id)
+        cand_score    = best_club_match_score(cand_history, team, start_year, end_year)
+        cand_activity = _has_activity(cand_history, start_year, end_year)
+
+        if not cand_activity or cand_pos_check is False:
+            print(f"        skipped: activity={cand_activity}, pos_check={cand_pos_check}")
+            continue
+
+        print(f"        club_score={cand_score:.2f}, activity={cand_activity}, "
+              f"pos_check={cand_pos_check}")
+
         if cand_score > best_candidate_score:
             best_candidate_score = cand_score
             best_candidate_id    = cand_id
+            best_cand_activity   = cand_activity
+            best_cand_pos_check  = cand_pos_check
+            best_cand_tm_pos     = cand_tm_pos
 
     if best_candidate_score >= MATCH_THRESHOLD:
-        print(f"    → AUTO_CORRECTED: {player_id} → {best_candidate_id}  (score {best_candidate_score:.2f})")
+        print(f"    → AUTO_CORRECTED: {player_id} → {best_candidate_id}"
+              f"  (score {best_candidate_score:.2f})")
         return {
             'status': 'AUTO_CORRECTED', 'old_id': player_id, 'new_id': best_candidate_id,
-            'score': best_candidate_score,
-            'confidence': 'HIGH' if best_candidate_score >= 0.85 else 'MEDIUM',
+            'score':          best_candidate_score,
+            'confidence':     'HIGH' if best_candidate_score >= 0.85 else 'MEDIUM',
+            'activity_ok':    best_cand_activity,
+            'position_check': best_cand_pos_check,
+            'tm_position':    best_cand_tm_pos,
+            'uefa_position':  uefa_position,
         }
 
     print(f"    → NEEDS_REVIEW: no good match found in top {TOP_N_SEARCH}")
     return {
         'status': 'NEEDS_REVIEW', 'old_id': player_id, 'new_id': player_id,
-        'score': score, 'confidence': 'LOW',
+        'score':          club_score,
+        'confidence':     'LOW',
+        'activity_ok':    activity_ok,
+        'position_check': pos_check,
+        'tm_position':    tm_position,
+        'uefa_position':  uefa_position,
     }
 
 
@@ -295,22 +432,34 @@ def process_year(year: int, log_rows: list) -> bool:
         if player_id is None:
             continue  # no ID assigned — out of scope for this script
 
+        uefa_position = str(row.get('Position', '') or '').strip() or None
+
         # Try to find pre-loaded history
         existing_hist = mv_cache.get((player_name, team)) if mv_cache else None
 
-        result = validate_player(player_name, team, player_id, year, existing_hist)
+        result = validate_player(
+            player_name, team, player_id, year, existing_hist,
+            uefa_position=uefa_position,
+        )
+
+        pos_check_val = result['position_check']
+        pos_check_str = 'SKIPPED' if pos_check_val is None else ('PASS' if pos_check_val else 'FAIL')
 
         # Record in log
         log_rows.append({
-            'Year':       year,
-            'Player Name': player_name,
-            'Team':        team,
-            'Old ID':      result['old_id'],
-            'New ID':      result['new_id'],
-            'Status':      result['status'],
-            'Confidence':  result['confidence'],
-            'Club Score':  round(result['score'], 3),
-            'Timestamp':   datetime.now().isoformat(),
+            'Year':           year,
+            'Player Name':    player_name,
+            'Team':           team,
+            'Old ID':         result['old_id'],
+            'New ID':         result['new_id'],
+            'Status':         result['status'],
+            'Confidence':     result['confidence'],
+            'Club Score':     round(result['score'], 3),
+            'Activity OK':    result['activity_ok'],
+            'Position Check': pos_check_str,
+            'UEFA Position':  result['uefa_position'],
+            'TM Position':    result['tm_position'],
+            'Timestamp':      datetime.now().isoformat(),
         })
 
         if result['status'] == 'AUTO_CORRECTED':
