@@ -45,6 +45,10 @@ LOG_FILE = DATA_DIR / 'Corrections_Log.xlsx'
 MATCH_THRESHOLD = 0.65   # fuzzy similarity floor for club name matching
 TOP_N_SEARCH    = 5      # candidates to check when a mismatch is found
 
+# Statuses that mean "already resolved — skip re-validation".
+# Set NEEDS_REVIEW → MANUALLY_VERIFIED in the log after you confirm an ID is correct.
+SKIP_STATUSES = {'VALID', 'AUTO_CORRECTED', 'MANUALLY_VERIFIED', 'MANUALLY_UPDATED'}
+
 # Known UEFA stats abbreviations → Transfermarkt full names
 TEAM_NORMALIZATION: dict[str, str] = {
     "B. Dortmund":       "Borussia Dortmund",
@@ -379,6 +383,59 @@ def validate_player(player_name: str, team: str, player_id: str,
 
 
 # ---------------------------------------------------------------------------
+# Skip-set: players already resolved in a prior run or manually verified
+# ---------------------------------------------------------------------------
+
+def load_skip_set(log_file: Path) -> set[tuple]:
+    """
+    Return (year, player_name, team) tuples whose most recent log entry has a
+    terminal status (VALID, AUTO_CORRECTED, MANUALLY_VERIFIED).
+    To mark a NEEDS_REVIEW player as confirmed-correct, change its status in
+    Corrections_Log.xlsx to MANUALLY_VERIFIED — this script will then skip it.
+    """
+    if not log_file.exists():
+        return set()
+    df = pd.read_excel(log_file)
+    if not {'Year', 'Player Name', 'Team', 'Status'}.issubset(df.columns):
+        return set()
+    # Use the most recent entry per (year, player, team) in case of duplicates
+    if 'Timestamp' in df.columns:
+        df = df.sort_values('Timestamp').groupby(
+            ['Year', 'Player Name', 'Team'], sort=False
+        ).last().reset_index()
+    skip = set()
+    for _, row in df.iterrows():
+        if row.get('Status') in SKIP_STATUSES:
+            skip.add((int(row['Year']), str(row['Player Name']), str(row['Team'])))
+    return skip
+
+
+def load_manual_updates(log_file: Path) -> dict[tuple, str]:
+    """
+    Return {(year, player_name, team): new_id} for all MANUALLY_UPDATED entries.
+    Set New ID to the correct Transfermarkt ID and Status to MANUALLY_UPDATED in
+    Corrections_Log.xlsx — the script will write that ID into _with_IDs.xlsx and
+    null the MV history so it gets re-fetched.
+    """
+    if not log_file.exists():
+        return {}
+    df = pd.read_excel(log_file)
+    if not {'Year', 'Player Name', 'Team', 'Status', 'New ID'}.issubset(df.columns):
+        return {}
+    if 'Timestamp' in df.columns:
+        df = df.sort_values('Timestamp').groupby(
+            ['Year', 'Player Name', 'Team'], sort=False
+        ).last().reset_index()
+    updates = {}
+    for _, row in df.iterrows():
+        if row.get('Status') == 'MANUALLY_UPDATED':
+            new_id = _id_str(row.get('New ID'))
+            if new_id:
+                updates[(int(row['Year']), str(row['Player Name']), str(row['Team']))] = new_id
+    return updates
+
+
+# ---------------------------------------------------------------------------
 # Per-year processing
 # ---------------------------------------------------------------------------
 
@@ -399,7 +456,7 @@ def load_existing_mv_history(mv_file: Path) -> dict[tuple, list] | None:
     return mapping
 
 
-def process_year(year: int, log_rows: list) -> bool:
+def process_year(year: int, log_rows: list, skip_set: set, manual_updates: dict) -> bool:
     ids_file = DATA_DIR / f'UEFA Stats {year}_with_IDs.xlsx'
     mv_file  = DATA_DIR / f'UEFA Stats {year}_with_market_values.xlsx'
 
@@ -424,6 +481,24 @@ def process_year(year: int, log_rows: list) -> bool:
 
     corrections_this_year = 0
 
+    # Apply manual ID updates from Corrections_Log (MANUALLY_UPDATED status)
+    for i, row in df_ids.iterrows():
+        pname  = str(row.get('Player Name', ''))
+        team_r = str(row.get('Team', ''))
+        new_id = manual_updates.get((year, pname, team_r))
+        if new_id is None:
+            continue
+        old_id = _id_str(row.get('Player ID'))
+        if old_id == new_id:
+            continue
+        df_ids.at[i, 'Player ID'] = int(new_id)
+        corrections_this_year += 1
+        print(f"  MANUALLY_UPDATED: {pname} ({team_r}): {old_id} → {new_id}")
+        if df_mv is not None:
+            mask = (df_mv['Player Name'] == pname) & (df_mv['Team'] == team_r)
+            if mask.any() and 'Market Value History' in df_mv.columns:
+                df_mv.loc[mask, 'Market Value History'] = None
+
     for i, row in df_ids.iterrows():
         player_name = str(row.get('Player Name', ''))
         team        = str(row.get('Team', ''))
@@ -431,6 +506,10 @@ def process_year(year: int, log_rows: list) -> bool:
 
         if player_id is None:
             continue  # no ID assigned — out of scope for this script
+
+        if (year, player_name, team) in skip_set:
+            print(f"    SKIPPED (already resolved): {player_name} ({team})")
+            continue
 
         uefa_position = str(row.get('Position', '') or '').strip() or None
 
@@ -500,10 +579,15 @@ def main():
     print(f"Player ID Validator")
     print(f"Years: {args.years}\n")
 
+    skip_set       = load_skip_set(LOG_FILE)
+    manual_updates = load_manual_updates(LOG_FILE)
+    print(f"Skip set loaded:     {len(skip_set)} already-resolved player-year entries.")
+    print(f"Manual updates:      {len(manual_updates)} MANUALLY_UPDATED entries to apply.\n")
+
     log_rows = []
 
     for year in args.years:
-        process_year(year, log_rows)
+        process_year(year, log_rows, skip_set, manual_updates)
 
     # Write / append corrections log
     if log_rows:
