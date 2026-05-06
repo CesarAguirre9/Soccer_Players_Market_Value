@@ -47,7 +47,7 @@ TOP_N_SEARCH    = 5      # candidates to check when a mismatch is found
 
 # Statuses that mean "already resolved — skip re-validation".
 # Set NEEDS_REVIEW → MANUALLY_VERIFIED in the log after you confirm an ID is correct.
-SKIP_STATUSES = {'VALID', 'AUTO_CORRECTED', 'MANUALLY_VERIFIED', 'MANUALLY_UPDATED'}
+SKIP_STATUSES = {'VALID', 'AUTO_CORRECTED', 'MANUALLY_VERIFIED', 'MANUALLY_UPDATED', 'CROSS_YEAR_CORRECTED'}
 
 # Known UEFA stats abbreviations → Transfermarkt full names
 TEAM_NORMALIZATION: dict[str, str] = {
@@ -435,6 +435,61 @@ def load_manual_updates(log_file: Path) -> dict[tuple, str]:
     return updates
 
 
+def build_cross_year_maps(log_file: Path, current_year: int) -> tuple[dict, dict]:
+    """
+    Scan resolved corrections from other years to build two lookup dicts.
+
+    id_name_map: {(old_id_str, player_name_lower) -> new_id_str}
+        Keyed by BOTH the wrong ID and the player name.  Using only the ID would
+        risk applying a correction to a different player who happens to share the
+        same wrong auto-assigned ID (e.g. two different "Fernandez" players both
+        getting ID 648195).  The name requirement ensures the correction only
+        propagates to the same person appearing in another season.
+
+    name_map: {player_name_lower -> new_id_str}
+        Fallback used only when the player name uniquely resolves to exactly one
+        correct ID across all other years — filters out common names like "Silva"
+        or "Moreno" that refer to multiple different players.
+
+    Both maps feed into the NEEDS_REVIEW rescue step in process_year(), where the
+    candidate is validated with a club-score + activity check before being applied.
+
+    Sources: AUTO_CORRECTED, MANUALLY_UPDATED, and CROSS_YEAR_CORRECTED entries
+    where Old ID != New ID.  CROSS_YEAR_CORRECTED from prior runs propagates
+    corrections to additional years on subsequent invocations.
+    """
+    if not log_file.exists():
+        return {}, {}
+    df = pd.read_excel(log_file)
+    if not {'Year', 'Player Name', 'Status', 'Old ID', 'New ID'}.issubset(df.columns):
+        return {}, {}
+
+    if 'Timestamp' in df.columns:
+        df = df.sort_values('Timestamp').groupby(
+            ['Year', 'Player Name', 'Team'], sort=False
+        ).last().reset_index()
+
+    correction_statuses = {'AUTO_CORRECTED', 'MANUALLY_UPDATED', 'CROSS_YEAR_CORRECTED'}
+    src = df[(df['Year'] != current_year) & (df['Status'].isin(correction_statuses))]
+
+    id_name_map: dict[tuple, str] = {}
+    name_ids:    dict[str, set]   = {}
+
+    for _, row in src.iterrows():
+        old_id = _id_str(row.get('Old ID'))
+        new_id = _id_str(row.get('New ID'))
+        if not old_id or not new_id or old_id == new_id:
+            continue
+        name = str(row.get('Player Name', '')).lower().strip()
+        if name:
+            id_name_map[(old_id, name)] = new_id
+            name_ids.setdefault(name, set()).add(new_id)
+
+    # Only keep names that resolve unambiguously to a single correct ID
+    name_map = {name: next(iter(ids)) for name, ids in name_ids.items() if len(ids) == 1}
+    return id_name_map, name_map
+
+
 # ---------------------------------------------------------------------------
 # Per-year processing
 # ---------------------------------------------------------------------------
@@ -493,11 +548,17 @@ def process_year(year: int, log_rows: list, skip_set: set, manual_updates: dict)
             continue
         df_ids.at[i, 'Player ID'] = int(new_id)
         corrections_this_year += 1
-        print(f"  MANUALLY_UPDATED: {pname} ({team_r}): {old_id} → {new_id}")
+        print(f"  MANUALLY_UPDATED: {pname} ({team_r}): {old_id} -> {new_id}")
         if df_mv is not None:
             mask = (df_mv['Player Name'] == pname) & (df_mv['Team'] == team_r)
             if mask.any() and 'Market Value History' in df_mv.columns:
                 df_mv.loc[mask, 'Market Value History'] = None
+
+    # Load cross-year candidates; used in the NEEDS_REVIEW rescue step below.
+    cross_year_id_name_map, cross_year_name_map = build_cross_year_maps(LOG_FILE, year)
+    if cross_year_id_name_map or cross_year_name_map:
+        print(f"  Cross-year map: {len(cross_year_id_name_map)} (id,name) pair(s), "
+              f"{len(cross_year_name_map)} unique-name pair(s)")
 
     for i, row in df_ids.iterrows():
         player_name = str(row.get('Player Name', ''))
@@ -521,6 +582,40 @@ def process_year(year: int, log_rows: list, skip_set: set, manual_updates: dict)
             uefa_position=uefa_position,
         )
 
+        # Cross-year rescue: if validation couldn't resolve the player, try a corrected
+        # ID from another year's corrections log.  The candidate is validated with a
+        # club-score + activity check before being applied, preventing false positives
+        # from players who share the same name or happened to receive the same wrong ID.
+        if result['status'] == 'NEEDS_REVIEW':
+            name_lower   = player_name.lower().strip()
+            cross_cand   = cross_year_id_name_map.get((player_id, name_lower))
+            if cross_cand is None:
+                cross_cand = cross_year_name_map.get(name_lower)
+
+            if cross_cand and cross_cand != player_id:
+                print(f"    Cross-year candidate {cross_cand} — validating...")
+                cand_hist     = fetch_mv_history(cross_cand)
+                cand_score    = best_club_match_score(cand_hist, team, year - 1, year)
+                cand_activity = _has_activity(cand_hist, year - 1, year)
+
+                if cand_activity and cand_score >= MATCH_THRESHOLD:
+                    print(f"    -> CROSS_YEAR_CORRECTED: {player_id} -> {cross_cand}"
+                          f"  (score {cand_score:.2f})")
+                    result = {
+                        'status':         'CROSS_YEAR_CORRECTED',
+                        'old_id':         player_id,
+                        'new_id':         cross_cand,
+                        'score':          cand_score,
+                        'confidence':     'HIGH' if cand_score >= 0.85 else 'MEDIUM',
+                        'activity_ok':    cand_activity,
+                        'position_check': result['position_check'],
+                        'tm_position':    None,
+                        'uefa_position':  uefa_position,
+                    }
+                else:
+                    print(f"    Cross-year candidate failed: score={cand_score:.2f}, "
+                          f"activity={cand_activity}")
+
         pos_check_val = result['position_check']
         pos_check_str = 'SKIPPED' if pos_check_val is None else ('PASS' if pos_check_val else 'FAIL')
 
@@ -541,7 +636,7 @@ def process_year(year: int, log_rows: list, skip_set: set, manual_updates: dict)
             'Timestamp':      datetime.now().isoformat(),
         })
 
-        if result['status'] == 'AUTO_CORRECTED':
+        if result['status'] in ('AUTO_CORRECTED', 'CROSS_YEAR_CORRECTED'):
             corrections_this_year += 1
             # Update ID in df_ids
             df_ids.at[i, 'Player ID'] = int(result['new_id'])
