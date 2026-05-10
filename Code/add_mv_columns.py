@@ -123,10 +123,12 @@ def add_mv_columns(year: int) -> None:
     col_prev_idx = headers.get(col_prev)
 
     for row_idx, (f_cur, f_prev) in enumerate(zip(formulas_cur, formulas_prev), start=2):
-        if f_cur and col_cur_idx:
-            ws.cell(row=row_idx, column=col_cur_idx, value=f_cur)
-        if f_prev and col_prev_idx:
-            ws.cell(row=row_idx, column=col_prev_idx, value=f_prev)
+        if col_cur_idx:
+            ws.cell(row=row_idx, column=col_cur_idx,
+                    value=f_cur if f_cur else f"Values in year {year} not found")
+        if col_prev_idx:
+            ws.cell(row=row_idx, column=col_prev_idx,
+                    value=f_prev if f_prev else f"Values in year {year - 1} not found")
 
     wb.save(filepath)
 
