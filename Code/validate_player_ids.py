@@ -536,23 +536,61 @@ def process_year(year: int, log_rows: list, skip_set: set, manual_updates: dict)
 
     corrections_this_year = 0
 
-    # Apply manual ID updates from Corrections_Log (MANUALLY_UPDATED status)
-    for i, row in df_ids.iterrows():
-        pname  = str(row.get('Player Name', ''))
-        team_r = str(row.get('Team', ''))
-        new_id = manual_updates.get((year, pname, team_r))
-        if new_id is None:
+    # Sync Player IDs from _with_IDs.xlsx into _with_market_values.xlsx.
+    # _with_market_values.xlsx can carry stale IDs from before corrections were applied
+    # (e.g. MANUALLY_VERIFIED players whose ID in the MV file never got updated).
+    # Any row where the ID changed has all fetched fields cleared for re-fetch.
+    _MV_FETCH_COLS = ['Market Value History', 'Player Country', 'Date of Birth', 'National Team']
+    if df_mv is not None and 'Player ID' in df_mv.columns:
+        id_lookup = {
+            (str(r.get('Player Name', '')), str(r.get('Team', ''))): _id_str(r.get('Player ID'))
+            for _, r in df_ids.iterrows()
+        }
+        id_synced = 0
+        for idx, row in df_mv.iterrows():
+            key = (str(row.get('Player Name', '')), str(row.get('Team', '')))
+            correct_id = id_lookup.get(key)
+            if correct_id and correct_id != _id_str(row.get('Player ID')):
+                df_mv.at[idx, 'Player ID'] = int(correct_id)
+                for col in _MV_FETCH_COLS:
+                    if col in df_mv.columns:
+                        df_mv.at[idx, col] = None
+                id_synced += 1
+        if id_synced:
+            corrections_this_year += id_synced
+            print(f"  ID sync: {id_synced} row(s) corrected in {mv_file.name} (fetched fields cleared)")
+
+    # Apply manual ID updates from Corrections_Log (MANUALLY_UPDATED status).
+    # Iterates the log directly so both files are updated independently —
+    # even when _with_IDs.xlsx already has the correct ID, _with_market_values.xlsx
+    # may still carry the old one and must be corrected.
+    for (log_year, pname, team_r), new_id in manual_updates.items():
+        if log_year != year:
             continue
-        old_id = _id_str(row.get('Player ID'))
-        if old_id == new_id:
-            continue
-        df_ids.at[i, 'Player ID'] = int(new_id)
-        corrections_this_year += 1
-        print(f"  MANUALLY_UPDATED: {pname} ({team_r}): {old_id} -> {new_id}")
+
+        # --- _with_IDs.xlsx ---
+        mask_ids = (df_ids['Player Name'].astype(str) == pname) & \
+                   (df_ids['Team'].astype(str) == team_r)
+        for i in df_ids[mask_ids].index:
+            old_id = _id_str(df_ids.at[i, 'Player ID'])
+            if old_id != new_id:
+                df_ids.at[i, 'Player ID'] = int(new_id)
+                corrections_this_year += 1
+                print(f"  MANUALLY_UPDATED (_with_IDs): {pname} ({team_r}): {old_id} -> {new_id}")
+
+        # --- _with_market_values.xlsx ---
         if df_mv is not None:
-            mask = (df_mv['Player Name'] == pname) & (df_mv['Team'] == team_r)
-            if mask.any() and 'Market Value History' in df_mv.columns:
-                df_mv.loc[mask, 'Market Value History'] = None
+            mask_mv = (df_mv['Player Name'].astype(str) == pname) & \
+                      (df_mv['Team'].astype(str) == team_r)
+            for idx in df_mv[mask_mv].index:
+                old_mv_id = _id_str(df_mv.at[idx, 'Player ID'])
+                df_mv.at[idx, 'Player ID'] = int(new_id)
+                if old_mv_id != new_id:
+                    for col in _MV_FETCH_COLS:
+                        if col in df_mv.columns:
+                            df_mv.at[idx, col] = None
+                    corrections_this_year += 1
+                    print(f"  MANUALLY_UPDATED (_with_market_values): {pname} ({team_r}): {old_mv_id} -> {new_id}")
 
     # Load cross-year candidates; used in the NEEDS_REVIEW rescue step below.
     cross_year_id_name_map, cross_year_name_map = build_cross_year_maps(LOG_FILE, year)
