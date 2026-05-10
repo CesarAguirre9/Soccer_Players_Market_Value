@@ -473,6 +473,31 @@ def process_year(year: int, limit: int | None = None, offline: bool = False) -> 
         print(f"  Neither input nor output file found. Skipping.")
         return False
 
+    # ---- sync Player IDs from _with_IDs.xlsx (authoritative after validate_player_ids.py) ----
+    # _with_market_values.xlsx can have stale IDs if corrections were applied after its last save.
+    # Any row whose ID changed has ALL fetched fields cleared so they re-fetch with the correct ID.
+    # MV history, Country, DOB, and National Team were all fetched using the old ID and may be wrong.
+    if output_file.exists() and input_file.exists():
+        df_ids_src = pd.read_excel(input_file)
+        id_lookup = {
+            (str(r.get('Player Name', '')), str(r.get('Team', ''))): _player_id_str(r.get('Player ID'))
+            for _, r in df_ids_src.iterrows()
+        }
+        synced = 0
+        for idx, row in df.iterrows():
+            key = (str(row.get('Player Name', '')), str(row.get('Team', '')))
+            correct_id = id_lookup.get(key)
+            if correct_id and correct_id != _player_id_str(row.get('Player ID')):
+                df.at[idx, 'Player ID'] = int(correct_id)
+                for col in [MV_COLUMN] + PROFILE_COLUMNS:
+                    if col in df.columns:
+                        df.at[idx, col] = None
+                synced += 1
+        if synced:
+            print(f"  ID sync: {synced} row(s) corrected from {input_file.name} (all fetched fields cleared for re-fetch)")
+            df.to_excel(output_file, index=False)
+            print(f"  [checkpoint] saved after ID sync")
+
     # Ensure target columns exist (may be absent on first run)
     for col in [MV_COLUMN] + PROFILE_COLUMNS:
         if col not in df.columns:
